@@ -10,14 +10,22 @@ import (
 	"github.com/garyburd/redigo/redis"
 	"time"
 	"flag"
+	"regexp"
+	"io"
+	"log"
+	"os"
 )
 
+const KEY_SPEED_INFO_PREFIX = "speed_info"
+const KEY_CLIENT_DHCP_NAMES = "client_names"
 type Config struct {
 	SpeedUrl string
-	NameUrl string
+	DhcpUrl string
 	Cookie string
 	Referer string
 	SleepSec time.Duration	// 采集间隔时间，单位秒
+	HttpServerPort uint16
+	LogFile string
 }
 
 func parse_config(file_path string) Config {
@@ -32,33 +40,36 @@ func parse_config(file_path string) Config {
 	}
 	return config
 }
-func sayhelloName(w http.ResponseWriter, r *http.Request) {
-    r.ParseForm()  //解析参数，默认是不会解析的
-    fmt.Println(r.Form)  //这些信息是输出到服务器端的打印信息
-    fmt.Println("path", r.URL.Path)
-    fmt.Println("scheme", r.URL.Scheme)
-    fmt.Println(r.Form["url_long"])
-    for k, v := range r.Form {
-        fmt.Println("key:", k)
-        fmt.Println("val:", strings.Join(v, ""))
-    }
-	cookie := http.Cookie{Name: "username", Value: "ming"}
-	http.SetCookie(w, &cookie)
-    fmt.Fprintf(w, "Hello astaxie!") //这个写入到w的是输出到客户端的
-}
+
+var logger *log.Logger
 
 func main() {
 	run_type := flag.String("t", "setter", "speed_monitor run type, setter or getter")
 	flag.Parse()
+	
+	// 初始化redis连接
 	conn := init_redis_client()
 	defer conn.Close()
+	
 	info := speed_infos{}
+	info.names = map[string]string{}
 	info.conn = conn
 	info.config = parse_config("./speed_monitor.conf")
+	
+	// 日志文件
+    logFile, err  := os.Create(info.config.LogFile)
+	defer logFile.Close()
+	if err != nil {
+		log.Fatalln("open log file fail")
+	}
+	logger = log.New(logFile, "", log.Lshortfile)
+	
 	if *run_type == "setter" {
 		info.get_and_save_speed()
 	} else if *run_type == "getter" {
-		
+		info.start_http_server()
+	} else if *run_type == "test" {
+		info.get_all_dhcp_client()
 	} else {
 		fmt.Println("wrong type")
 	}
@@ -73,12 +84,56 @@ type machine struct {
 
 type speed_infos struct {
 	machines []machine
+	names map[string]string	// key: mac, value:machine name
 	config Config
 	conn redis.Conn
 }
 
-func (infos* speed_infos) get_all_name() {
-//	name_str := infos.request(infos.config.SpeedUrl)
+func (infos* speed_infos) get_all_dhcp_client() {
+	dhcp_str := infos.request(infos.config.DhcpUrl)
+	re, _ := regexp.Compile("var DHCPDynList=new Array\\(\n((.*\n)*?)0,0 \\);\n")
+	submath := re.FindSubmatch([]byte(dhcp_str))
+	if len(submath) == 3 {
+		dhcp_clients_str := string(submath[1])
+		items := strings.Split(dhcp_clients_str, ",\n")
+		for i:= 0; i + 1 < len(items); i += 4 {
+			mac := strings.Replace(items[i + 1], "\"", "", -1)
+			name := strings.Replace(items[i], "\"", "", -1)
+			infos.names[mac] = name
+			infos.conn.Do("HSET", KEY_CLIENT_DHCP_NAMES, mac, name)
+		}
+	}
+}
+
+func (infos* speed_infos) get_speed(w http.ResponseWriter, req *http.Request) {
+	// 取得所有的key
+	keys, err := redis.Strings(infos.conn.Do("KEYS", KEY_SPEED_INFO_PREFIX + ":*"))
+	if err != nil {
+		panic(err)
+	}
+	output := []string{}
+	for _, key := range keys {
+		info, _ := redis.String(infos.conn.Do("LINDEX", key, -1))
+		item := strings.Split(info, "|")
+		mac := strings.TrimLeft(key, KEY_SPEED_INFO_PREFIX + ":")
+		name, _ := redis.String(infos.conn.Do("HGET", KEY_CLIENT_DHCP_NAMES, mac))
+		raw_up, _ := strconv.ParseUint(item[2], 10, 64)
+		raw_down, _ := strconv.ParseUint(item[3], 10, 64)
+		up_speed := get_readable_speed_str(raw_up)
+		down_speed := get_readable_speed_str(raw_down)
+		output = append(output, fmt.Sprintf("name:%20v|up_speed:%10v|down_speed:%10v",
+			name, up_speed, down_speed))
+	}
+	io.WriteString(w, strings.Join(output, "\n"))
+}
+
+func (infos* speed_infos) start_http_server() {
+	http.HandleFunc("/get_speed", infos.get_speed)
+	addr := fmt.Sprintf(":%v", infos.config.HttpServerPort)
+	err := http.ListenAndServe(addr, nil)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func (infos* speed_infos) get_and_save_speed() {
@@ -92,13 +147,13 @@ func (infos* speed_infos) get_and_save_speed() {
 			if machine.up_speed == 0 && machine.down_speed == 0 {
 				continue
 			}
-			key := "speed_info:" + machine.mac
+			key := KEY_SPEED_INFO_PREFIX + ":" + machine.mac
 			value := fmt.Sprintf("%v|%v|%v|%v", now, machine.ip, machine.up_speed,
 				machine.down_speed)
-			fmt.Println("key: " + key)
-			fmt.Println("value: " + value)
+			logger.Printf("save speed to redis, key[%v] value[%v]\n", key, value)
 			infos.conn.Do("LPUSH", key, value)
 		}
+		infos.get_all_dhcp_client()
 		time.Sleep(infos.config.SleepSec * time.Second)
 	}
 }

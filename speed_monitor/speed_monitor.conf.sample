@@ -1,7 +1,9 @@
 {
     "SpeedUrl":"xxxxxxxxxxxxx",
-    "NameUrl":"xxxxxxxxxxx",
+    "DhcpUrl":"xxxxxxxxxxx",
     "Cookie":"xxxxxxxxxxxxx",
     "Referer":"xxxxxxxxxx",
-	"SleepSec":5
+	"SleepSec":5,
+	"HttpServerPort":1111,
+	"LogFile":speed_monitor.log
 }
