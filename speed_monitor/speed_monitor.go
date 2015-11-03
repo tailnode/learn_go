@@ -14,10 +14,13 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
 )
 
-const KEY_SPEED_INFO_PREFIX = "speed_info"
-const KEY_CLIENT_DHCP_NAMES = "client_names"
+const KEY_SPEED_INFO_PRE = "speed_info"
+const KEY_CLIENT_STATUS_PRE = "client_status"		// 机器上线/下线列表
+const KEY_CLIENT_DHCP_NAMES = "client_names"	// 机器MAC对应的DHCP分配的名称
+const KEY_ONLINE_CLIENTT = "online_client"		// 在线的机器
 type Config struct {
 	SpeedUrl string
 	DhcpUrl string
@@ -65,9 +68,11 @@ func main() {
 	logger = log.New(logFile, "", log.Lshortfile)
 	
 	if *run_type == "setter" {
-		info.get_and_save_speed()
-	} else if *run_type == "getter" {
-		info.start_http_server()
+		runtime.GOMAXPROCS(2)
+		go info.get_and_save_speed()
+		go info.start_http_server()
+		ch := make(chan int)
+		<- ch
 	} else if *run_type == "test" {
 		info.get_all_dhcp_client()
 	} else {
@@ -85,6 +90,7 @@ type machine struct {
 type speed_infos struct {
 	machines []machine
 	names map[string]string	// key: mac, value:machine name
+	online_clients map[string] bool
 	config Config
 	conn redis.Conn
 }
@@ -107,15 +113,15 @@ func (infos* speed_infos) get_all_dhcp_client() {
 
 func (infos* speed_infos) get_speed(w http.ResponseWriter, req *http.Request) {
 	// 取得所有的key
-	keys, err := redis.Strings(infos.conn.Do("KEYS", KEY_SPEED_INFO_PREFIX + ":*"))
+	keys, err := redis.Strings(infos.conn.Do("KEYS", KEY_SPEED_INFO_PRE + ":*"))
 	if err != nil {
 		panic(err)
 	}
 	output := []string{}
 	for _, key := range keys {
-		info, _ := redis.String(infos.conn.Do("LINDEX", key, -1))
+		info, _ := redis.String(infos.conn.Do("LINDEX", key, 0))
 		item := strings.Split(info, "|")
-		mac := strings.TrimLeft(key, KEY_SPEED_INFO_PREFIX + ":")
+		mac := strings.TrimLeft(key, KEY_SPEED_INFO_PRE + ":")
 		name, _ := redis.String(infos.conn.Do("HGET", KEY_CLIENT_DHCP_NAMES, mac))
 		raw_up, _ := strconv.ParseUint(item[2], 10, 64)
 		raw_down, _ := strconv.ParseUint(item[3], 10, 64)
@@ -140,20 +146,43 @@ func (infos* speed_infos) get_and_save_speed() {
 	for {
 		infos.get_all_speed()
 		now := time.Now().Unix()
-		type machines struct {
-			machine []machine
-		}
+		old_clients := infos.online_clients
+		infos.online_clients = map[string]bool{}
 		for _, machine := range infos.machines {
+			infos.online_clients[machine.mac] = true
 			if machine.up_speed == 0 && machine.down_speed == 0 {
 				continue
 			}
-			key := KEY_SPEED_INFO_PREFIX + ":" + machine.mac
+			key := KEY_SPEED_INFO_PRE + ":" + machine.mac
 			value := fmt.Sprintf("%v|%v|%v|%v", now, machine.ip, machine.up_speed,
 				machine.down_speed)
 			logger.Printf("save speed to redis, key[%v] value[%v]\n", key, value)
 			infos.conn.Do("LPUSH", key, value)
 		}
+		// 保存当前在线的机器MAC		
+		infos.conn.Do("DEL", KEY_ONLINE_CLIENTT)
+		for mac, _ := range infos.online_clients {
+			logger.Printf("add client[%v] to key [%v]\n", mac, KEY_ONLINE_CLIENTT)
+			infos.conn.Do("SADD", KEY_ONLINE_CLIENTT, mac)
+		}
+		// 检查上线/下线的机器，写入redis,暂时忽略第一次运行的情况
+		online_clients := map_diff(infos.online_clients, old_clients)
+		offline_clients := map_diff(old_clients, infos.online_clients)
+		for mac, _ := range online_clients {
+			// key[client_status:ab-cd-xxxx] value[1446561630|1]
+			key := fmt.Sprintf("%v:%v", KEY_CLIENT_STATUS_PRE, mac)
+			value := fmt.Sprintf("%v|1", now)
+			infos.conn.Do("LPUSH", key, value)
+		}
+		for mac, _ := range offline_clients {
+			// key[client_status:ab-cd-xxxx] value[1446561630|0]
+			key := fmt.Sprintf("%v:%v", KEY_CLIENT_STATUS_PRE, mac)
+			value := fmt.Sprintf("%v|0", now)
+			infos.conn.Do("LPUSH", key, value)
+		}
+		
 		infos.get_all_dhcp_client()
+		
 		time.Sleep(infos.config.SleepSec * time.Second)
 	}
 }
@@ -243,4 +272,15 @@ func init_redis_client () redis.Conn {
 	}
 	
 	return c
+}
+
+// 求a有b没有的key/value
+func map_diff(a, b map[string]bool) map[string]bool{
+	diff := map[string]bool{}
+	for key, _ := range a {
+		if _, ok := b[key]; !ok {
+			diff[key] = true
+		}
+	}
+	return diff
 }
