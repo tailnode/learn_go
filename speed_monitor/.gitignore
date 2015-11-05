@@ -1,3 +1,4 @@
 *.swp
+*.log
 speed_monitor
 speed_monitor.conf
